@@ -53,10 +53,7 @@ def _get_checklist_rows_with_frequency(equipment_type: str) -> list[dict]:
 
 
 def _mwo_exists(equipment: str, scheduled_date, task_description: str) -> bool:
-    """
-    Check if a Maintenance Work Order already exists for the same equipment,
-    due date and task description.
-    """
+   
     return bool(
         frappe.db.exists(
             "Maintenance Work Order",
@@ -70,10 +67,7 @@ def _mwo_exists(equipment: str, scheduled_date, task_description: str) -> bool:
     )
 @frappe.whitelist()
 def schedule_preventive_work_orders(equipment_name: str):
-    """
-    Generate preventive Maintenance Work Orders for a given Equipment Registry
-    based on each checklist row's frequency.
-    """
+    
     eq = frappe.get_doc("Equipment Registry", equipment_name)
 
     # Safety check
@@ -92,7 +86,7 @@ def schedule_preventive_work_orders(equipment_name: str):
 
     first_due_overall = None
     total_created = 0
-    cycles = 4   # create 4 future occurrences for each checklist row
+    cycles = 4   
 
     for item in checklist_items:
         frequency = (item.get("frequency") or "").strip()
@@ -107,12 +101,11 @@ def schedule_preventive_work_orders(equipment_name: str):
             if not due_date:
                 continue
 
-            # Avoid duplicates
+          
             if _mwo_exists(eq.name, due_date, task_description):
                 frappe.logger().info(f"[AutoSchedule] exists {task_description} {due_date}")
                 continue
 
-            # Create the Maintenance Work Order
             mwo = frappe.new_doc("Maintenance Work Order")
             mwo.update({
                 "work_order_type": "Preventive",
@@ -137,7 +130,6 @@ def schedule_preventive_work_orders(equipment_name: str):
             if not first_due_overall or due_date < first_due_overall:
                 first_due_overall = due_date
 
-    # Update next_maintenance_due on the Equipment Registry
     if first_due_overall:
         eq.db_set("next_maintenance_due", getdate(first_due_overall))
 
@@ -145,16 +137,91 @@ def schedule_preventive_work_orders(equipment_name: str):
     frappe.logger().info(f"[AutoSchedule] finish {equipment_name} created={total_created}")
 
 
-# -------------------------------------------------------------------
-# Hook entry point (if using hooks.py)
-# -------------------------------------------------------------------
+import frappe
+from frappe.model.document import Document
 
-def after_insert_handler(doc, method=None):
-    """
-    Hook function so that hooks.py can call it.
-    """
-    try:
-        frappe.logger().info(f"[AutoSchedule] hook after_insert for {doc.name}")
-        schedule_preventive_work_orders(doc.name)
-    except Exception:
-        frappe.log_error("Auto-scheduling MWOs failed (hook)", frappe.get_traceback())
+class EquipmentRegistry(Document):
+
+    def after_insert(self):
+        """Auto-send email to technician when a new Equipment Registry is created."""
+        try:
+            self.notify_assigned_technician()
+        except Exception:
+            # ensure insertion doesn't fail silently because of notify errors
+            frappe.log_error(frappe.get_traceback(), "EquipmentRegistry.after_insert: notify failed")
+
+    @frappe.whitelist()
+    def notify_assigned_technician(self):
+        """Send email to the assigned technician of this equipment registry."""
+        if not self.assigned_technician:
+            return {"success": False, "error": "No assigned technician set."}
+
+        # fetch employee email (prefer cached lookup)
+        emp = frappe.db.get_value(
+            "Employee",
+            self.assigned_technician,
+            ["company_email", "personal_email", "user_id"],
+            as_dict=True
+        ) or {}
+
+        recipient = emp.get("company_email") or emp.get("personal_email")
+
+        # fallback to User's email if employee is linked
+        if not recipient and emp.get("user_id"):
+            recipient = frappe.get_cached_value("User", emp.get("user_id"), "email")
+
+        if not recipient:
+            # mark email_sent = 0 if field exists (safe-check)
+            try:
+                if self.meta.get_field("email_sent"):
+                    self.db_set("email_sent", 0)
+            except Exception:
+                pass
+
+            return {"success": False, "error": "Assigned employee has no email configured."}
+
+        subject = f"Equipment Assigned: {self.equipment_name or self.name}"
+        message = frappe.render_template("""
+            <p>Hi {{tech_name}},</p>
+            <p>You have been assigned responsibility for Equipment <b>{{eq_name}}</b>.</p>
+            <p><b>Details:</b><br>
+            - Type: {{eq_type}}<br>
+            - Description: {{description}}<br>
+            - Registry ID: {{registry}}</p>
+            <p>Regards,<br>{{company}}</p>
+        """, {
+            "tech_name": self.assigned_technician,
+            "eq_name": self.equipment_name or self.name,
+            "eq_type": self.equipment_type or "N/A",
+            "description": self.get("description") or "N/A",
+            "registry": self.name,
+            "company": frappe.db.get_single_value("Global Defaults", "default_company") or ""
+        })
+
+        try:
+            frappe.sendmail(
+                recipients=[recipient],
+                subject=subject,
+                message=message,
+                reference_doctype=self.doctype,
+                reference_name=self.name,
+                retry=False
+            )
+
+            # version-safe set flag if field exists
+            try:
+                if self.meta.get_field("email_sent"):
+                    self.db_set("email_sent", 1)
+            except Exception:
+                # log but don't raise
+                frappe.log_error(frappe.get_traceback(), "EquipmentRegistry.notify_assigned_technician: db_set email_sent failed")
+
+            return {"success": True, "email_sent": True}
+        except Exception as e:
+            frappe.log_error(frappe.get_traceback(), "Send Email (Equipment Registry)")
+            try:
+                if self.meta.get_field("email_sent"):
+                    self.db_set("email_sent", 0)
+            except Exception:
+                pass
+            return {"success": False, "error": str(e)}
