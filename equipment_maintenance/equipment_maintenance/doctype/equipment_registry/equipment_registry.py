@@ -6,24 +6,7 @@ from frappe.model.document import Document
 from frappe.utils import add_days, add_months, getdate, today
 
 
-class EquipmentRegistry(Document):
-    """Controller for Equipment Registry"""
-
-    def after_insert(self):
-        """
-        Triggered automatically after a new Equipment Registry record is created.
-        This will schedule preventive Maintenance Work Orders.
-        """
-        try:
-            frappe.logger().info(f"[AutoSchedule] after_insert for {self.name}")
-            schedule_preventive_work_orders(self.name)
-        except Exception:
-            frappe.log_error("Auto-scheduling MWOs failed", frappe.get_traceback())
-
 def _add_interval(start, frequency: str, cycle_no: int):
-    """
-    Return the next due date based on frequency string and cycle number.
-    """
     if frequency == "Daily":
         return add_days(start, cycle_no * 1)
     if frequency == "Weekly":
@@ -38,14 +21,13 @@ def _add_interval(start, frequency: str, cycle_no: int):
 
 
 def _get_checklist_rows_with_frequency(equipment_type: str) -> list[dict]:
-    
     if not equipment_type:
         return []
-
     return frappe.get_all(
-        "Standard Maintenance Checklist Item",           
+        "Standard Maintenance Checklist Item",
         filters={
-            "parentfield": "standard_maintenance_checklist_table_with_checkpoints",  # <-- parent table fieldname
+            # make sure this matches the *child table fieldname* in your parent doctype
+            "parentfield": "standard_maintenance_checklist_table_with_checkpoints",
         },
         fields=["checkpoint", "description", "frequency"],
         order_by="idx asc",
@@ -53,7 +35,6 @@ def _get_checklist_rows_with_frequency(equipment_type: str) -> list[dict]:
 
 
 def _mwo_exists(equipment: str, scheduled_date, task_description: str) -> bool:
-   
     return bool(
         frappe.db.exists(
             "Maintenance Work Order",
@@ -65,12 +46,13 @@ def _mwo_exists(equipment: str, scheduled_date, task_description: str) -> bool:
             },
         )
     )
+
+
 @frappe.whitelist()
 def schedule_preventive_work_orders(equipment_name: str):
-    
     eq = frappe.get_doc("Equipment Registry", equipment_name)
 
-    # Safety check
+    # skip decommissioned
     if (eq.status or "").strip().lower() == "decommissioned":
         frappe.msgprint(f"Skipping: {eq.name} is Decommissioned.")
         frappe.logger().info(f"[AutoSchedule] skip decommissioned {equipment_name}")
@@ -86,12 +68,12 @@ def schedule_preventive_work_orders(equipment_name: str):
 
     first_due_overall = None
     total_created = 0
-    cycles = 4   
+    cycles = 4  
 
     for item in checklist_items:
         frequency = (item.get("frequency") or "").strip()
         if not frequency:
-            frappe.logger().info(f"[AutoSchedule] skip {item.checkpoint} (no frequency)")
+            frappe.logger().info(f"[AutoSchedule] skip (no frequency) item={item}")
             continue
 
         task_description = item.get("checkpoint") or item.get("description") or "Checklist Task"
@@ -101,7 +83,6 @@ def schedule_preventive_work_orders(equipment_name: str):
             if not due_date:
                 continue
 
-          
             if _mwo_exists(eq.name, due_date, task_description):
                 frappe.logger().info(f"[AutoSchedule] exists {task_description} {due_date}")
                 continue
@@ -116,13 +97,10 @@ def schedule_preventive_work_orders(equipment_name: str):
                 "assigned_technician": eq.assigned_technician,
                 "description": f"{task_description} ({frequency})",
             })
-
-            # Add the task row inside MWO
             mwo.append("maintenance_tasks", {
                 "task_description": task_description,
                 "is_completed": 0
             })
-
             mwo.insert(ignore_permissions=True)
             frappe.logger().info(f"[AutoSchedule] created MWO {mwo.name} for {task_description}")
             total_created += 1
@@ -137,17 +115,24 @@ def schedule_preventive_work_orders(equipment_name: str):
     frappe.logger().info(f"[AutoSchedule] finish {equipment_name} created={total_created}")
 
 
-import frappe
-from frappe.model.document import Document
-
 class EquipmentRegistry(Document):
+    """Controller for Equipment Registry"""
 
     def after_insert(self):
-        """Auto-send email to technician when a new Equipment Registry is created."""
+        """
+        Triggered automatically after a new Equipment Registry record is created.
+        Schedules preventive MWOs and notifies the assigned tech.
+        """
+        try:
+            frappe.logger().info(f"[AutoSchedule] after_insert for {self.name}")
+            schedule_preventive_work_orders(self.name)
+        except Exception:
+            frappe.log_error("Auto-scheduling MWOs failed", frappe.get_traceback())
+
+        # keep email independent; failure here shouldn't block insert
         try:
             self.notify_assigned_technician()
         except Exception:
-            # ensure insertion doesn't fail silently because of notify errors
             frappe.log_error(frappe.get_traceback(), "EquipmentRegistry.after_insert: notify failed")
 
     @frappe.whitelist()
@@ -156,7 +141,6 @@ class EquipmentRegistry(Document):
         if not self.assigned_technician:
             return {"success": False, "error": "No assigned technician set."}
 
-        # fetch employee email (prefer cached lookup)
         emp = frappe.db.get_value(
             "Employee",
             self.assigned_technician,
@@ -165,19 +149,15 @@ class EquipmentRegistry(Document):
         ) or {}
 
         recipient = emp.get("company_email") or emp.get("personal_email")
-
-        # fallback to User's email if employee is linked
         if not recipient and emp.get("user_id"):
             recipient = frappe.get_cached_value("User", emp.get("user_id"), "email")
 
         if not recipient:
-            # mark email_sent = 0 if field exists (safe-check)
             try:
                 if self.meta.get_field("email_sent"):
                     self.db_set("email_sent", 0)
             except Exception:
                 pass
-
             return {"success": False, "error": "Assigned employee has no email configured."}
 
         subject = f"Equipment Assigned: {self.equipment_name or self.name}"
@@ -207,15 +187,11 @@ class EquipmentRegistry(Document):
                 reference_name=self.name,
                 retry=False
             )
-
-            # version-safe set flag if field exists
             try:
                 if self.meta.get_field("email_sent"):
                     self.db_set("email_sent", 1)
             except Exception:
-                # log but don't raise
                 frappe.log_error(frappe.get_traceback(), "EquipmentRegistry.notify_assigned_technician: db_set email_sent failed")
-
             return {"success": True, "email_sent": True}
         except Exception as e:
             frappe.log_error(frappe.get_traceback(), "Send Email (Equipment Registry)")
