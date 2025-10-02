@@ -1,41 +1,36 @@
-
 import frappe
 from frappe.model.document import Document
-from frappe.utils import get_datetime
+from frappe import _
 
 class MaintenanceWorkOrder(Document):
-	pass
-    # def validate(self):
-    #     equipment_status = frappe.db.get_value("Equipment Registry", self.equipment, "status")
-    #     if equipment_status == "Decommissioned":
-    #         frappe.throw("Cannot create Work Order for Decommissioned Equipment.")
+    def on_submit(self):
+        # The trigger condition now checks if the single 'link_gtub' field has a value.
+        if self.link_gtub:
+            self.create_material_request()
 
-    # def before_save(self):
-    #     total_parts_cost = 0
-    #     for part in self.parts_used:
-    #         total_parts_cost += part.qty * part.rate
+    def create_material_request(self):
+        try:
+            # Create the Material Request document in memory.
+            material_request = frappe.get_doc({
+                "doctype": "Material Request",
+                "material_request_type": "Purchase",
+                "company": "Demo",
+                "custom_maintenance_work_order": self.name 
+            })
+            material_request.append("items", {
+                "item_code": self.link_gtub,
+                "qty": 1, 
+                "schedule_date": self.scheduled_date or frappe.utils.today()
+            })
+            
+            material_request.insert(ignore_permissions=True)
+            material_request.submit()
+            
+            frappe.msgprint(
+                _("Material Request <a href='/app/material-request/{0}'>{0}</a> created.").format(material_request.name),
+                indicator="green"
+            )
 
-    #     technician_hourly_rate = 500 
-    #     total_labor_cost = self.labor_hours * technician_hourly_rate
-
-    #     self.total_cost = total_parts_cost + total_labor_cost
-
-    # def on_submit(self):
-
-    #     equipment = frappe.get_doc("Equipment Registry", self.equipment)
-    #     if self.status == "In Progress":
-    #         equipment.status = "Under Maintenance"
-    #     elif self.status == "Completed":
-    #         equipment.status = "Active"
-    #         equipment.last_maintenance_date = get_datetime(self.completion_date).date()
-          
-    #     equipment.save()
-
-    #       if self.assigned_technician:
-    #         technician_email = frappe.db.get_value("Employee", self.assigned_technician, "company_email")
-    #         if technician_email:
-    #             frappe.sendmail(
-    #                 recipients=technician_email,
-    #                 subject=f"New Work Order Assigned: {self.name}",
-    #                 message=f"You have been assigned a new maintenance work order {self.name} for {self.equipment}."
-    #             )
+        except Exception as e:
+            frappe.log_error(frappe.get_traceback(), "Material Request Creation Failed")
+            frappe.throw(_("Failed to create Material Request: {0}").format(e))
